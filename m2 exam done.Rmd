@@ -1,0 +1,2264 @@
+---
+title: "Multiclass exam"
+author: "Andreas, Kristoffer, Mikkel og Simon"
+date: "31/10/2021"
+output:
+   pdf_document:
+     latex_engine: xelatex
+---
+# packages
+```{r, warning = FALSE, message = FALSE}
+library(tidyverse)
+
+library(lubridate)
+
+library(magrittr)
+
+library(FactoMineR)
+
+library(factoextra)
+
+library(uwot)
+
+library(GGally)
+
+library(rsample)
+
+library(ggridges)
+
+library(xgboost)
+
+library(recipes)
+
+library(parsnip)
+
+library(glmnet)
+
+library(tidymodels)
+
+library(skimr)
+
+library(VIM)
+
+library(visdat)
+
+library(ggmap)
+
+library(ranger)
+
+library(vip)
+
+library(SnowballC)
+
+library(tokenizers)
+
+library(formatR)
+```
+
+#load data
+
+```{r, warning=FALSE, message=FALSE}
+#titles <- read_csv("https://raw.githubusercontent.com/simonmig10/M2-sds/main/netflix_titles.csv")
+data_imdb <- read_csv("https://raw.githubusercontent.com/simonmig10/M2-sds/Simon/IMDb%20movies.csv")
+
+```
+
+# Data
+
+Here we create data for multiclass supervised machinelearning
+```{r}
+data_multi= data_imdb %>% 
+  filter(genre %in% c("Drama", "Comedy", "Horror", "Thriller"), year >= 2000) %>%
+  filter(language == "English") %>%
+  select(genre, description) %>%
+  rename(text = description) %>%
+  rename(y= genre)
+```
+
+
+```{r}
+#data_netflix= titles %>%
+  #inner_join(data_imdb, by= "title")
+```
+
+Here we create data for later embeding, where "data_emb_genre" and "data_emb_title" are created for joining in genres and titles later. And "data_network_emb" used for network analysis
+```{r}
+data_emb_genre = data_imdb %>%
+  select(imdb_title_id, genre)
+
+data_emb_title = data_imdb %>%
+  select(imdb_title_id, title)
+
+data_network_emb = data_imdb %>%
+  filter(genre %in% c("Drama", "Comedy", "Horror", "Thriller"), year >= 2000) %>%
+  filter(language == "English") %>%
+  drop_na() %>%
+  rename(text = description) %>%
+  rename(id= imdb_title_id) %>%
+  arrange(desc(avg_vote)) %>%
+  select(avg_vote, everything()) %>%
+  head(100) %>%
+  select(id, text)
+
+data_emb = data_imdb %>% 
+  filter(genre %in% c("Drama", "Comedy", "Horror", "Thriller"), year >= 2000) %>%
+  filter(language == "English") %>%
+  rename(text = description) %>%
+  rename(id= imdb_title_id) %>%
+  select(id, text)
+```
+
+Here we create data for visualization
+```{r}
+data_genre <- data_imdb %>%
+  filter(genre %in% c("Drama", "Comedy", "Horror", "Thriller"), year >= 2000) %>%
+  filter(language == "English")
+
+data_genre <- tibble(ID = data_genre[[1]], 
+                 text = data_genre[[14]] %>% as.character(), 
+                 labels = data_genre[[6]] %>% as.character())
+```
+
+
+# Preprocessing / EDA
+
+## Words by genre
+
+We now want to extract the most common words in the 4 genres: Drama, Thriller, Comedy, Horror. 
+
+First we tokenize the data
+
+```{r}
+library(tidytext)
+text_genre_tidy = data_genre %>% unnest_tokens(word, text, token = "words")
+```
+
+We remove short words and stopwords. 
+
+```{r}
+text_genre_tidy %<>%
+  filter(str_length(word) > 2 ) %>% 
+  group_by(word) %>%
+  ungroup() %>%
+  anti_join(stop_words, by = 'word') 
+```
+
+Stemming: We use the hunspell package which seems to produce the best stemming for our data. 
+The only word which seems to create problems is "broth" so we remove this. 
+```{r}
+library(hunspell)
+text_genre_tidy %>%
+  mutate(stem = hunspell_stem(word)) %>%
+  unnest(stem) %>%
+  count(stem, sort = TRUE)
+text_genre_tidy %<>% 
+  mutate(stem = hunspell_stem(word)) %>%
+  unnest(stem) %>%
+   select(-word) %>%
+  rename(word = stem) %>%
+  filter(!word == "broth")
+```
+
+
+We weight the data using tf-idf. (Term-frequency Inverse document frequency)
+
+```{r}
+# TFIDF weights
+text_genre_tidy %<>%
+  add_count(ID, word) %>%
+  bind_tf_idf(term = word,
+              document = ID,
+              n = n)
+
+text_genre_tidy %>%
+  count(word, sort = T)
+```
+
+
+We show the 25 most common words 
+```{r}
+# TFIDF topwords
+text_genre_tidy %>%
+  count(word, wt = tf_idf, sort = TRUE) %>%
+  head(25)
+```
+We now plot the 12 most used words within each genre
+
+```{r}
+labels_words <- text_genre_tidy %>%
+  group_by(labels) %>%
+  count(word, wt = tf_idf, sort = TRUE, name = "tf_idf") %>%
+  dplyr::slice(1:12) %>% 
+  ungroup() 
+
+labels_words %>%
+  mutate(word = reorder_within(word, by = tf_idf, within = labels)) %>%
+  ggplot(aes(x = word, y = tf_idf, fill = labels)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~labels, ncol = 2, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  theme(axis.text.y = element_text(size = 6))
+```
+
+
+## Comedy wordcloud
+
+We now want to look at some nice EDA within the Drama and Comedy genre. 
+
+
+```{r}
+text_tidy_comedy = text_genre_tidy %>%
+  filter(labels == "Comedy")
+```
+
+```{r}
+library(wordcloud)
+
+text_tidy_comedy %>%
+  count(word) %>%
+  with(wordcloud(word, n, 
+                 max.words = 50, 
+                 color = "blue"))
+```
+
+## Drama wordcloud
+
+
+```{r}
+text_tidy_drama = text_genre_tidy %>%
+  filter(labels == "Drama")
+```
+
+
+```{r}
+# People love wordclouds
+library(wordcloud)
+
+text_tidy_drama %>%
+  count(word) %>%
+  with(wordcloud(word, n, 
+                 max.words = 50, 
+                 color = "blue"))
+```
+
+
+## Sentiment Analysis
+
+We do a sentiment analysis based on the different genres. 
+
+```{r}
+library(textdata)
+
+text_tidy_drama_index= text_tidy_drama %>%
+  mutate(index= 1:n())
+
+```
+
+
+We use the lexicons "bing" and "afinn" to get a measure for positivity and negativity for each word. 
+
+We use inner_join to only get the words we use from the lexicon. 
+
+```{r}
+
+#Bing
+sentiment_bing <- text_tidy_drama_index %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, index = index %/% 100, sentiment) %>% 
+  mutate(lexicon = 'Bing')
+
+# Afinn
+sentiment_afinn <- text_tidy_drama_index %>%  
+  inner_join(get_sentiments("afinn")) %>%
+  group_by(index = index %/% 100)  %>% 
+  summarise(sentiment = sum(value, na.rm = TRUE)) %>%
+  mutate(lexicon = 'AFINN')
+
+```
+
+We join the measures from both lexicons 
+
+```{r}
+# Lets join them all together for plotting
+sentiment_all <- sentiment_afinn %>%
+  bind_rows(sentiment_bing %>%
+              pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>% 
+              mutate(sentiment = positive - negative) %>%
+              select(index, sentiment, lexicon))
+```
+
+We create a plot for the distribution between negative and positive words within the data genre. 
+
+```{r}
+sentiment_all %>%
+  ggplot(aes(x = index, y = sentiment, fill = lexicon)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ lexicon) + 
+  labs(title = "Sentiment Analysis: “Drama",
+       subtitle = 'Using the Bing, AFINN lexicon')
+```
+
+## Senteminet wordcloud
+
+We can now create a wordcloud looking at the positive and negative words in the Drama genre. 
+
+```{r}
+text_tidy_drama %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>% 
+  filter(sentiment %in% c("positive", "negative")) %>%
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>%
+  as.data.frame() %>% 
+  remove_rownames() %>% 
+  column_to_rownames("word") %>% 
+  comparison.cloud(colors = c("darkgreen", "red"), 
+                   max.words = 100,
+                   title.size = 1.5)
+```
+
+
+
+# Network analysis
+
+## Co-Word Network
+
+We want to create a network which shows words linked together in a description within the drama genre. 
+
+```{r}
+library(widyr)
+el_words <- text_tidy_drama_index %>%
+  pairwise_count(word, ID, sort = TRUE) %>%
+  rename(from = item1, to = item2, weight = n)
+```
+
+```{r}
+library(tidygraph)
+library(ggraph)
+```
+
+
+```{r}
+g <- el_words %>%
+  filter(weight >= 9) %>%
+  as_tbl_graph(directed = FALSE) %>%
+  igraph::simplify() %>% as_tbl_graph()
+```
+
+
+
+```{r,fig.width=10,fig.height=6,fig.align='center'}
+set.seed(1337)
+g %N>%
+  filter(centrality_degree(weight = weight) > 100) %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(color = weight, edge_alpha = weight)) +
+  geom_node_point(aes(size = centrality_degree(weight = weight)), color = "plum4") +
+  geom_node_text(aes(label = name,), repel = TRUE) +
+  theme_graph(base_family="sans") +
+  theme(legend.position = 'bottom') +
+  labs(title = 'Co-Word Network Drama')
+```
+
+We can see that life seems to be the most central word in Drama descriptions 
+
+## Bigrams
+
+We now want to create the same network just using bigrams. 
+
+
+```{r}
+
+data_multi2= data_imdb %>% 
+  filter(genre %in% c("Drama", "Comedy", "Horror", "Thriller"), year >= 2000) %>%
+  filter(language == "English") %>%
+  select(imdb_title_id, description) %>%
+  rename(text = description) %>%
+  rename(id= imdb_title_id)
+
+text_tidy_ngrams = data_multi2 %>% 
+  unnest_tokens(bigram, text, token = "ngrams", n = 2) %>% 
+  na.omit() 
+```
+
+Here we get the top 100 used bigrams within all four genres. 
+
+```{r}
+text_tidy_ngrams %>% 
+  count(bigram, sort = TRUE) %>%
+  head(100)
+```
+a lot of the most common bigrams are stopwords, so these will be removed
+
+```{r}
+text_tidy_ngrams %<>%
+  separate(bigram, c("word1", "word2"), sep = " ") %>% 
+  anti_join(stop_words, by = c('word1' = 'word')) %>%
+  anti_join(stop_words, by = c('word2' = 'word')) %>% 
+  unite(bigram, word1, word2, sep = " ") %>% 
+  count(id, bigram)
+text_tidy_ngrams %>% 
+  count(bigram, wt = n, sort = TRUE) %>%
+  head(50)
+```
+These are the most used bigrams through the four genres analyzed.
+
+```{r,fig.width=10,fig.height=6,fig.align='center'}
+bi = text_tidy_ngrams %>% left_join(text_tidy_ngrams %>% select(id, bigram), by = "id")
+bi = bi %>% select(-id) %>% 
+  rename(from = bigram.x, to = bigram.y) %>% 
+  filter(from != to); head(bi)
+```
+
+```{r}
+bi = bi %>% count(from, to, name = 'weight') 
+bi %>% 
+  count(weight)
+```
+a lot of bigram combination only happend once, which is not very important so those are removed.
+
+
+```{r}
+bi = bi %>% filter(weight >= 2)
+bi %>% arrange(desc(weight))
+```
+all combinations of bigrams are present twice as of now, which can be seen by the first two observations above. So the next thing to do is to remove duplicates.
+
+```{r}
+bi = bi[!duplicated(t(apply(bi[c("from", "to")], 1, sort))), ]
+bi %>% 
+  arrange(desc(weight))
+```
+That helped a lot.
+
+Then the network is created using table_graph
+
+```{r}
+g <- bi %>% as_tbl_graph(directed = FALSE) ; g
+```
+
+Each node represent a bigram and each edge a connection bigrams who apeared in the same movie descriptions together the weight being the number of times.
+
+Then centrality measures are calculated
+
+```{r}
+g <- g %N>%
+  mutate(cent_dgr = centrality_degree(weights = weight),
+         cent_eigen = centrality_eigen(weights = weight),
+         cent_between = centrality_betweenness(weights = weight))
+g %N>%
+  as_tibble() %>% 
+  arrange(desc(cent_dgr))
+```
+
+Centrality degree: How many connections a node has - what it tells: How many direct, one hop connections each node has to other nodes in the network.
+
+Betweenness centrality: Measures the number of times a node lies on the shortest path between other nodes. - What it tells: This measure shows which nodes are bridges between nodes in a network. It does this by identifying all the shortest paths and then counting how many times each node falls on one.
+
+Eigen centrality: Like degree centrality, EigenCentrality measures a node's influence based on the number of links it has to other nodes in the network. EigenCentrality then goes a step further by also taking into account how well connected a node is, and how many links their connections have, and so on through the network. - What it tells: By calculating the extended connections of a node, EigenCentrality can identify nodes with influence over the whole network, not just those directly connected to it.
+
+Now the network will be ploted for nodes haveing an centrality degree of above two, to only show the most important bigrams.
+```{r,fig.width=10,fig.height=6,fig.align='center'}
+set.seed(1337)
+g %N>%
+  filter(centrality_degree(weight = weight) > 2) %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(color = weight, edge_alpha = weight)) +
+  geom_node_point(aes(size = centrality_degree(weight = weight)), color = "plum4") +
+  geom_node_text(aes(label = name,), repel = TRUE) +
+  theme_graph(base_family="sans") +
+  theme(legend.position = 'bottom') +
+  labs(title = 'Bigram moive network')
+```
+
+
+## 2-mode network 
+
+
+By extracting the words and genres a 2-mode network can be created using the as_tbl_graph function. Further manipulation is done to make node types, which is done to make sure, that nodes with the same type cant connect.
+
+```{r}
+library(tidygraph)
+
+edgelist = tibble(name = labels_words$labels, words = labels_words$word)
+g = as_tbl_graph(edgelist)
+g = g %N>% mutate(type = as.logical(c(rep(0,4), rep(1, 36)))) 
+```
+
+Then the 2-mode network is plotted
+```{r,,fig.width=10,fig.height=6,fig.align='center'}
+
+library(ggraph)
+
+set.seed(1337)
+p <- g %>% ggraph("bipartite") + 
+  geom_edge_link(alpha = 0.25) + 
+  geom_node_point(aes(col = type, size = centrality_degree(mode = 'all'))) + 
+  geom_node_text(aes(label = name), repel = TRUE) + 
+  theme_graph(base_family="sans") +
+  theme(legend.position = 'none') + 
+  labs(title = '2-mode network Genres-words')
+p
+```
+
+We can eg. see that life is used a lot within the genres Comedy, Drama and Thrillers but not within the Horror genre. 
+
+
+Now a 1-mode network is made both between genres and words.
+```{r}
+library(igraph)
+
+g_projected <- g %>% bipartite_projection()
+g_genre = g_projected[["proj1"]] %>% as_tbl_graph(directed = FALSE)
+g_words = g_projected[["proj2"]] %>% as_tbl_graph(directed = FALSE)
+```
+
+Then both networks are plotted
+```{r}
+set.seed(1337)
+library(patchwork)
+p2 <- g_genre %>% ggraph(layout = "nicely") + 
+  geom_node_point(aes(size = centrality_degree(weights = weight)), col = 'red') + 
+  geom_edge_link(aes(width = weight), alpha = 0.25) +
+  scale_edge_width(range = c(0.1, 2)) + 
+  geom_node_text(aes(label = name), repel = TRUE) +
+  theme_graph(base_family="sans") + 
+  theme(legend.position = 'none') + 
+  labs(title = '1-mode network genres')
+p3 <- g_words %>% ggraph(layout = "nicely") + 
+  geom_node_point(aes(size = centrality_degree(weights = weight)), col = 'skyblue2') + 
+  geom_edge_link(aes(width = weight), alpha = 0.25) +
+  scale_edge_width(range = c(0.1, 2)) + 
+  geom_node_text(aes(label = name), repel = TRUE) +
+  theme_graph(base_family="sans") + 
+  theme(legend.position = 'none') + 
+  labs(title = '1-mode network work')
+p2 + p3
+```
+In the left network we can see that the thicker the line the more words the two genres have in common. 
+
+In the right network we see the words that are used within the same genres, with an edge showing that the words are used together within a genre, and the width showing how many times they are used together, and the size of the node showing how many genres they are represented in. 
+
+# Multiclass sml model
+
+We now want to create a multiclass supervised machinelearning model to predict which genre a movie is in, based on its description. 
+
+
+First we look for missing values. 
+```{r}
+vis_dat(data_multi)
+```
+We remove NA's and look at the distribution between the four classes.
+```{r}
+data_multi %<>%
+  drop_na()
+
+data_multi %>% 
+  count(y) %>% 
+  ggplot(aes(x = y, y = n)) + 
+  geom_col()
+```
+We can see that Drama is much more represented than Thriller, so we have to do some down or upsampling. 
+
+We will create three different recipies one using embedding, one using tf-idf and one using Hash.
+
+So we load the embeddings using the "textdata" package.
+
+```{r}
+library(textdata)
+
+glove6b <- embedding_glove6b(dimensions = 100)
+```
+
+
+
+We create a training and test dataset using strata=y to get the same ratio between the classes in both the training and test dataset.  
+
+```{r}
+set.seed(19)
+
+tidy_split <- initial_split(data_multi, strata = y)
+
+train_data <- training(tidy_split)
+test_data <- testing(tidy_split)
+
+```
+We use downsampling only on the training data to better fit the model 
+
+```{r}
+train_data <- recipe(y~., data = train_data) %>% 
+  themis::step_downsample(y) %>% 
+  prep() %>% 
+  juice()
+
+
+train_data %>%
+  count(y)
+```
+And can now see that the classes are evenly distributed. 
+
+
+We create the three recipies we want to use. 
+```{r}
+
+library(textrecipes)
+
+tf_idf_rec <- recipe(y~., data = train_data) %>% 
+  step_tokenize(text) %>% 
+  step_stem(text) %>% 
+  step_stopwords(text) %>% 
+  step_tokenfilter(text, max_tokens = 1000) %>% 
+  step_tfidf(all_predictors()) %>%
+  prep() %>%
+  juice()
+
+
+embeddings_rec <- recipe(y~., data = train_data) %>% 
+  step_tokenize(text) %>% 
+  step_stem(text) %>% 
+  step_stopwords(text) %>% 
+  step_tokenfilter(text, max_tokens = 1000) %>% 
+  step_word_embeddings(text, embeddings = embedding_glove6b())
+
+
+hash_rec <- recipe(y~., data = train_data) %>% 
+  step_tokenize(text) %>% 
+  step_stem(text) %>% 
+  step_stopwords(text) %>% 
+  step_tokenfilter(text, max_tokens = 1000) %>% 
+  step_texthash(text, num_terms = 100) 
+
+```
+
+
+## Define models Term frequency
+
+We define three models:
+
+All models are coded to do multiclass predcitions. 
+We set some of the parameters for tuning. 
+
+### Logistic model
+
+```{r}
+model_lg <- multinom_reg(penalty = tune(), mixture = 1) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("classification")
+```
+
+### KNN model
+
+```{r}
+model_knn <- nearest_neighbor(neighbors = tune()) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+```
+
+
+### Random Forrest
+```{r}
+model_rf <- 
+  rand_forest() %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+```
+
+## Workflow 
+
+We create workflows for each recipe. 
+
+### tf_idf
+
+```{r}
+workflow_general_tf <- workflow() %>%
+  add_recipe(tf_idf_rec)
+
+workflow_lg_tf <- workflow_general_tf %>%
+  add_model(model_lg)
+
+workflow_knn_tf <- workflow_general_tf %>%
+  add_model(model_knn)
+
+workflow_rf_tf <- workflow_general_tf %>%
+  add_model(model_rf)
+```
+
+
+### Embeding
+
+```{r}
+workflow_general_emb <- workflow() %>%
+  add_recipe(embeddings_rec)
+
+workflow_lg_emb <- workflow_general_emb %>%
+  add_model(model_lg)
+
+workflow_knn_emb <- workflow_general_emb %>%
+  add_model(model_knn)
+
+workflow_rf_emb <- workflow_general_emb %>%
+  add_model(model_rf)
+```
+
+
+### hash
+
+```{r}
+workflow_general_hash <- workflow() %>%
+  add_recipe(hash_rec)
+
+workflow_lg_hash <- workflow_general_hash %>%
+  add_model(model_lg)
+
+workflow_knn_hash <- workflow_general_hash %>%
+  add_model(model_knn)
+
+workflow_rf_hash <- workflow_general_hash %>%
+  add_model(model_rf)
+```
+
+## Hyper tuneing 
+
+We use vfold_cv to create resampled data. to perfrom hypertuning and fitting. 
+```{r}
+set.seed(100)
+
+k_folds_data <- train_data %>% 
+  vfold_cv(strata = y,
+           v = 3,
+           repeats = 3)
+```
+
+### Define Grids
+
+We define the grids we want to use for the hypertuning 
+```{r}
+logistic_grid <- grid_regular(parameters(model_lg), levels = 3)
+knn_grid <- grid_regular(parameters(model_knn), levels = 5, filter = c(neighbors > 1))
+```
+The level defines the amount of parameters that should be considered. 
+
+### Define tuning process
+
+We define which measures we want to be able to choose best parameters from. 
+```{r}
+model_control <- control_grid(save_pred = TRUE)
+model_metrics <- metric_set(accuracy, sens, spec, mn_log_loss, roc_auc)
+```
+
+
+### Tune Models
+
+We tune the three different models 
+```{r}
+# Tune hash models
+linear_hash_res <- tune_grid(
+  model_lg,
+  hash_rec,
+  grid = logistic_grid,
+  control = model_control,
+  metrics = model_metrics,
+  resamples = k_folds_data
+)
+
+
+knn_hash_res <- tune_grid(
+  model_knn,
+  hash_rec,
+  grid = knn_grid,
+  control = model_control,
+  metrics = model_metrics,
+  resamples = k_folds_data
+)
+```
+
+
+```{r}
+# Tune embed models
+linear_embed_res <- tune_grid(
+  model_lg,
+  embeddings_rec,
+  grid = logistic_grid,
+  control = model_control,
+  metrics = model_metrics,
+  resamples = k_folds_data
+)
+
+
+knn_embed_res <- tune_grid(
+  model_knn,
+  embeddings_rec,
+  grid = knn_grid,
+  control = model_control,
+  metrics = model_metrics,
+  resamples = k_folds_data
+)
+```
+
+
+```{r}
+# Tune tf-idf models
+linear_tf_res <- tune_grid(
+  model_lg,
+  tf_idf_rec,
+  grid = logistic_grid,
+  control = model_control,
+  metrics = model_metrics,
+  resamples = k_folds_data
+)
+
+
+knn_tf_res <- tune_grid(
+  model_knn,
+  tf_idf_rec,
+  grid = knn_grid,
+  control = model_control,
+  metrics = model_metrics,
+  resamples = k_folds_data
+)
+
+```
+
+
+### Best parameters
+
+We look at the different optimizations and choose the best parameters. 
+
+#### linear_embed_res
+
+We use autoplot
+
+```{r}
+linear_hash_res %>% autoplot()
+```
+
+```{r}
+best_param_linear_hash_res <- linear_hash_res %>% select_best(metric = 'accuracy')
+best_param_linear_hash_res
+```
+#### knn_embed_res
+
+We use autoplot
+
+```{r}
+knn_hash_res %>% autoplot()
+```
+
+```{r}
+best_param_knn_hash_res <- knn_hash_res %>% select_best(metric = 'accuracy')
+best_param_knn_hash_res
+```
+
+#### linear_embed_res
+
+We use autoplot
+
+```{r}
+linear_embed_res %>% autoplot()
+```
+
+```{r}
+best_param_linear_embed_res <- linear_embed_res %>% select_best(metric = 'accuracy')
+best_param_linear_embed_res
+```
+#### knn_embed_res
+
+We use autoplot
+
+```{r}
+knn_embed_res %>% autoplot()
+```
+
+```{r}
+best_param_knn_embed_res <- knn_embed_res %>% select_best(metric = 'accuracy')
+best_param_knn_embed_res
+```
+
+#### linear_tf_res
+
+We use autoplot
+
+```{r}
+linear_tf_res %>% autoplot()
+```
+
+```{r}
+best_param_linear_tf_res <- linear_tf_res %>% select_best(metric = 'accuracy')
+best_param_linear_tf_res
+```
+
+#### knn_tf_res
+
+We use autoplot
+
+```{r}
+knn_tf_res %>% autoplot()
+```
+
+```{r}
+best_param_knn_tf_res <- knn_tf_res %>% select_best(metric = 'accuracy')
+best_param_knn_tf_res
+```
+
+## Finalize workflows
+
+We now fit the best parameters into the workflow of the two models that needed hypertuning. 
+
+### Hash
+
+```{r}
+workflow_final_lg_hash <- workflow_lg_hash %>%
+  finalize_workflow(parameters = best_param_linear_hash_res)
+
+workflow_final_knn_hash <- workflow_knn_hash %>%
+  finalize_workflow(parameters = best_param_knn_hash_res)
+```
+
+
+### Tf-idf
+
+```{r}
+workflow_final_lg_tf <- workflow_lg_tf %>%
+  finalize_workflow(parameters = best_param_linear_tf_res)
+
+workflow_final_knn_tf <- workflow_knn_tf %>%
+  finalize_workflow(parameters = best_param_knn_tf_res)
+```
+
+
+### Embedings
+
+```{r}
+workflow_final_lg_emb <- workflow_lg_emb %>%
+  finalize_workflow(parameters = best_param_linear_embed_res)
+
+workflow_final_knn_emb <- workflow_knn_emb %>%
+  finalize_workflow(parameters = best_param_knn_embed_res)
+```
+
+
+## Evaluate models
+
+
+here we us the resampled data to evaluate the models. 
+
+### Logistic regression
+
+
+#### hash
+
+```{r}
+
+log_res_hash <- 
+  workflow_final_lg_hash %>% 
+  fit_resamples(
+    resamples = k_folds_data, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+log_res_hash %>% collect_metrics(summarize = TRUE)
+
+```
+
+#### Tf_idf
+
+```{r}
+
+log_res_tf <- 
+  workflow_final_lg_tf %>% 
+  fit_resamples(
+    resamples = k_folds_data, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+log_res_tf %>% collect_metrics(summarize = TRUE)
+
+```
+#### Embeding
+
+```{r}
+
+log_res_emb <- 
+  workflow_final_lg_emb %>% 
+  fit_resamples(
+    resamples = k_folds_data, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+log_res_emb %>% collect_metrics(summarize = TRUE)
+
+```
+
+
+
+### KNN model
+
+#### Hash
+
+```{r}
+
+knn_res_hash <- 
+  workflow_final_knn_hash %>% 
+  fit_resamples(
+    resamples = k_folds_data, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+knn_res_hash %>% collect_metrics(summarize = TRUE)
+
+```
+
+#### TF-idf
+
+```{r}
+
+knn_res_tf <- 
+  workflow_final_knn_tf %>% 
+  fit_resamples(
+    resamples = k_folds_data, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+knn_res_tf %>% collect_metrics(summarize = TRUE)
+
+```
+
+#### Embedings
+
+```{r}
+
+knn_res_emb <- 
+  workflow_final_knn_emb %>% 
+  fit_resamples(
+    resamples = k_folds_data, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+knn_res_emb %>% collect_metrics(summarize = TRUE)
+
+```
+
+### Random forest model
+
+#### hash
+
+```{r}
+
+rf_res_hash <- 
+  workflow_rf_hash %>% 
+  fit_resamples(
+    resamples = k_folds_data, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+rf_res_hash %>% collect_metrics(summarize = TRUE)
+
+```
+
+#### TF-idf
+
+```{r}
+
+rf_res_tf <- 
+  workflow_rf_tf %>% 
+  fit_resamples(
+    resamples = k_folds_data, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+rf_res_tf %>% collect_metrics(summarize = TRUE)
+
+```
+
+#### Embedings
+
+```{r}
+
+rf_res_emb <- 
+  workflow_rf_emb %>% 
+  fit_resamples(
+    resamples = k_folds_data, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+rf_res_emb %>% collect_metrics(summarize = TRUE)
+
+```
+
+
+## Compare performance
+
+We get a summary for the performed models. We add the model name to each metric to keep the models appart from each other later on. 
+
+```{r}
+log_metrics_tf <- 
+  log_res_tf %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Logistic Regression TF-idf") 
+
+log_metrics_emb <- 
+  log_res_emb %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Logistic Regression Embeding") 
+
+log_metrics_hash <- 
+  log_res_hash %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Logistic Regression Hash") 
+
+rf_metrics_tf <- 
+  rf_res_tf %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Random Forest TF-idf")
+
+rf_metrics_emb <- 
+  rf_res_emb %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Random Forest Embeding")
+
+rf_metrics_hash <- 
+  rf_res_hash %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Random Forest Hash")
+
+knn_metrics_tf <- 
+  knn_res_tf %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Knn TF-idf")
+
+knn_metrics_emb <- 
+  knn_res_emb %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Knn Embeding")
+
+knn_metrics_hash <- 
+  knn_res_hash %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Knn Hash")
+
+```
+
+```{r}
+model_compare <- bind_rows(
+                          log_metrics_tf,
+                          log_metrics_emb,
+                          log_metrics_hash,
+                          rf_metrics_tf,
+                          rf_metrics_emb,
+                          rf_metrics_hash,
+                          knn_metrics_tf,
+                          knn_metrics_emb,
+                          knn_metrics_hash
+                           ) 
+
+
+model_comp <- 
+  model_compare %>% 
+  select(model, .metric, mean, std_err) %>% 
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err)) 
+
+
+model_comp %>% 
+  arrange(mean_f_meas) %>% 
+  mutate(model = fct_reorder(model, mean_f_meas)) %>% 
+  ggplot(aes(model, mean_f_meas, fill=model)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_brewer(palette = "Blues") +
+   geom_text(
+     size = 3,
+     aes(label = round(mean_f_meas, 2), y = mean_f_meas + 0.08),
+     vjust = 1
+  )
+```
+
+```{r}
+model_comp %>% 
+  arrange(mean_roc_auc) %>% 
+  mutate(model = fct_reorder(model, mean_roc_auc)) %>%
+  ggplot(aes(model, mean_roc_auc, fill=model)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_brewer(palette = "Blues") + 
+     geom_text(
+     size = 3,
+     aes(label = round(mean_roc_auc, 2), y = mean_roc_auc + 0.08),
+     vjust = 1
+  )
+```
+
+
+
+
+## Choose model
+
+The best model seems to be Random Forest using TF-idf we also look at the second best model which is the Logistic Regression model using TF-idf
+
+So we only continue with the two best ones. 
+
+
+### Log-reg model
+
+#### Performance metrics
+Show average performance over all folds: 
+
+```{r}
+log_res_tf %>%  collect_metrics(summarize = TRUE)
+```
+#### Collect model predictions
+To obtain the actual model predictions, we use the function collect_predictions and save the result as log_pred:
+
+```{r}
+log_pred_tf <- 
+  log_res_tf %>%
+  collect_predictions()
+```
+
+#### Confusion Matrix
+
+We can now use our collected predictions to make a confusion matrix
+```{r}
+log_pred_tf %>% 
+  conf_mat(y, .pred_class) 
+```
+
+```{r}
+log_pred_tf %>% 
+  conf_mat(y, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+We can see the model does okay predicting the correct genres. 
+
+#### ROC curve
+
+We will now create the ROC curve with 1 - specificity on the x-axis (false positive fraction = FP/(FP+TN)) and sensitivity on the y axis (true positive fraction = TP/(TP+FN)). 
+```{r}
+log_pred_tf %>% 
+  roc_curve(y, .pred_Comedy:.pred_Thriller) %>% 
+  autoplot()
+```
+
+
+
+### Random forest model
+
+#### Collect model predictions
+To obtain the actual model predictions, we use the function collect_predictions and save the result as log_pred:
+
+```{r}
+rf_pred_tf <- 
+  rf_res_tf %>%
+  collect_predictions()
+```
+
+#### Performance metrics
+Show average performance over all folds (note that we use log_res):
+
+```{r}
+rf_res_tf %>%  collect_metrics(summarize = TRUE)
+```
+
+
+#### Confusion Matrix
+
+We can now use our collected predictions to make a confusion matrix
+```{r}
+rf_pred_tf %>% 
+  conf_mat(y, .pred_class) 
+```
+
+
+```{r}
+rf_pred_tf %>% 
+  conf_mat(y, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+
+
+#### ROC curve
+
+We will now create the ROC curve with 1 - specificity on the x-axis (false positive fraction = FP/(FP+TN)) and sensitivity on the y axis (true positive fraction = TP/(TP+FN)). 
+```{r}
+rf_pred_tf %>% 
+  roc_curve(y, .pred_Comedy:.pred_Thriller) %>% 
+  autoplot()
+```
+
+## Models on test data
+
+We now want to look at how the two models perform on test data. 
+
+### Random forest model
+
+```{r}
+last_fit_rf <- last_fit(workflow_rf_tf, 
+                        split = tidy_split,
+                        metrics = metric_set(
+                          recall, precision, f_meas, 
+                          accuracy, kap,
+                          roc_auc, sens, spec)
+                        )
+```
+
+
+```{r}
+last_fit_rf %>% 
+  collect_metrics()
+```
+
+WWe can again make a confusinmatrix on the testdata predictions
+
+```{r}
+last_fit_rf %>%
+  collect_predictions() %>% 
+  conf_mat(y, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+```
+
+```{r}
+last_fit_rf %>% 
+  collect_predictions() %>% 
+  roc_curve(y, .pred_Comedy:.pred_Thriller) %>% 
+  autoplot()
+```
+
+### Logistic model
+
+```{r}
+last_fit_log <- last_fit(workflow_final_lg_tf, 
+                        split = tidy_split,
+                        metrics = metric_set(
+                          recall, precision, f_meas, 
+                          accuracy, kap,
+                          roc_auc, sens, spec)
+                        )
+```
+
+
+```{r}
+last_fit_log %>% 
+  collect_metrics()
+```
+
+```{r}
+last_fit_log %>%
+  collect_predictions() %>% 
+  conf_mat(y, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+```
+
+```{r}
+last_fit_log %>% 
+  collect_predictions() %>% 
+  roc_curve(y, .pred_Comedy:.pred_Thriller) %>% 
+  autoplot()
+```
+
+
+
+
+# Embedding 
+
+We now want to use embedding data to do some machine learning and prediction using words and sentences. 
+
+## Preprocessing Embedding
+
+We start using the same preprocessing as we did on the genre data used for machine learning and networks. 
+
+```{r}
+data_emb %<>%
+  drop_na()
+
+text_tidy_emb = data_emb %>% unnest_tokens(word, text, token = "words")
+
+```
+
+
+```{r}
+library(hunspell)
+
+text_tidy_emb %>%
+  mutate(stem = hunspell_stem(word)) %>%
+  unnest(stem) %>%
+  count(stem, sort = TRUE)
+
+text_tidy_emb %<>% 
+  mutate(stem = hunspell_stem(word)) %>%
+  unnest(stem) %>%
+   select(-word) %>%
+  rename(word = stem)
+```
+We remove stopwords
+```{r}
+text_tidy_emb %<>% 
+  anti_join(stop_words) %>%
+  count(id, word)
+```
+We wheight by TF-idf
+```{r}
+text_tidy_emb %<>%
+  bind_tf_idf(term = word,
+              document = id,
+              n = n)
+```
+
+## Embeding on imdb data
+
+Joining our tidy tokenlist and the glove6b embeddings, which gives a list of mutual words within the two lists. 
+```{r}
+word_embeddings <- text_tidy_emb %>%
+  inner_join(glove6b, by = c('word' = 'token'))%>%
+  select(-c(tf, idf))
+```
+
+we can take a look at the new list. 
+```{r}
+word_embeddings %>% head()
+```
+
+We could also (even better) weight that by the word’s tf-idf score. and group by id
+```{r}
+doc_embeddings <- word_embeddings %>%
+  group_by(id) %>%
+  summarise(across(starts_with("d"), ~mean(.x / tf_idf, na.rm = TRUE)))
+```
+
+
+
+## Umap
+
+These embddings could now be used for instance for some clustering in relation to UML.so we want to do some unsupervised machine learning using UMAP
+```{r}
+library(uwot) # for UMAP
+```
+
+
+We use left_join to label each movie id with the respective genre
+
+```{r}
+doc_embeddings_genre= doc_embeddings %>%
+  left_join(data_emb_genre, by= c("id"= "imdb_title_id")) %>%
+  select(genre, everything())
+
+```
+We save the genres before we use UMAP to use it for collaring clusters later. 
+```{r}
+genre_class=doc_embeddings_genre[,1]
+```
+
+
+
+We reduce wordlist to two dimensions with UMAP. 
+```{r}
+embeddings_umap <- doc_embeddings  %>% 
+  column_to_rownames("id") %>%
+  umap(n_neighbors = 15, 
+       metric = "cosine", 
+       min_dist = 0.01, 
+       scale = TRUE,
+       verbose = TRUE, 
+       n_threads = 8) 
+
+```
+
+We define these two dimensions as a data frame. 
+```{r}
+embeddings_umap %<>% as.data.frame()
+```
+
+We plot these two dimensions to see if they separate into clusters. we collor by genre to see if there is any clustering within genres.  
+```{r}
+embeddings_umap  %>% 
+  as_tibble() %>%
+  bind_cols(genre_class) %>%
+  ggplot(aes(x = V1, y = V2, col= genre)) + 
+  geom_point(shape = 21, alpha = 0.5)
+```
+We see that there doesnt seem to be any clustering based on the four genres. 
+
+
+
+We load the "dbscan" which is used to detect clusters within the data
+```{r}
+library(dbscan)
+```
+We create clusters using hirarchical density based clustering
+we set minPts to 150 which means eaccch cluster should be at least 150 observations.  
+
+```{r}
+embeddings_hdbscan <- embeddings_umap %>% as.matrix() %>% hdbscan(minPts = 150)
+```
+
+
+We again use UMAP and color by the clusters created 
+
+```{r}
+embeddings_umap %>% 
+  bind_cols(cluster = embeddings_hdbscan$cluster %>% as.factor(), 
+            prob = embeddings_hdbscan$membership_prob) %>%
+  ggplot(aes(x = V1, y = V2, col = cluster)) + 
+  geom_point(aes(alpha = prob), shape = 21) 
+```
+We can see this looks way better. 
+
+
+
+
+## Sml on embedded data
+
+We now want to use supervised machine learning on the embedded data. we only want to predict wether the movie is within the Drama genre or Not. 
+
+```{r}
+data_class= data_imdb %>%
+  select(imdb_title_id, genre)
+
+data_class %>%
+  count(genre, sort = T)
+
+library(naniar)
+
+test_data=data_class %>%
+  filter(genre == "Drama")
+```
+
+We can now left join with id so we get the embeddings for every id and genre, keep in mind there will be the same description (embedings) for some genre observations as they are classified with more genres. 
+
+
+```{r}
+new_data_sml_class=doc_embeddings %>%
+  left_join(test_data, by= c("id"= "imdb_title_id"))%>%
+  select(genre, everything()) %>%
+  replace_na(replace = list(genre= "Not Drama"))%>%
+  distinct(.keep_all = T) %>% #remove dublicans
+  rename(y= genre) %>%
+  select(-id) 
+```
+
+```{r}
+new_data_sml_class %>% 
+  ggplot(aes(y, fill= y)) +
+  geom_bar() 
+```
+We can see the two classes are not evenly represented. so we can use the strata argument to keep the same ratio in the training and test dataset. 
+
+```{r}
+set.seed(123)
+
+data_split <- initial_split(new_data_sml_class, prop = 0.75, strata = y)
+
+data_train <- data_split  %>%  training()
+data_test <- data_split %>% testing()
+```
+
+We center the data to mean = 0, and scale the data to have an Standard deviation equal to 1. 
+
+```{r}
+
+data_recipe <- data_train %>%
+  recipe(y ~.) %>%
+  step_center(all_numeric(), -all_outcomes()) %>%
+  step_scale(all_numeric(), -all_outcomes()) %>%
+  #step_dummy(all_nominal(), -all_outcomes()) %>%
+  prep()
+
+
+summary(data_recipe)
+
+```
+
+## Defining the models
+
+
+We now define the four models we end up looking at. 
+
+### Logistic Regression
+
+
+```{r}
+model_lg <- logistic_reg(mode = 'classification') %>%
+  set_engine('glm', family = binomial) 
+```
+
+### Decision tree
+
+```{r}
+model_dt <- decision_tree(mode = 'classification',
+                          cost_complexity = tune(),
+                          tree_depth = tune(), 
+                          min_n = tune()
+                          ) %>%
+  set_engine('rpart') 
+```
+
+
+
+### K-nearest neighbor
+```{r}
+model_knn <- 
+  nearest_neighbor(neighbors = 4) %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification") 
+
+
+```
+
+
+### Random forest
+```{r}
+model_rf <- 
+  rand_forest() %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+
+
+```
+
+
+## Define workflow
+
+We will now define the workflow of the model by adding first the recipe to a general workflow, and then using this to create a workflow for each model. 
+
+```{r}
+workflow_general <- workflow() %>%
+  add_recipe(data_recipe) 
+
+workflow_lg <- workflow_general %>%
+  add_model(model_lg)
+
+workflow_dt <- workflow_general %>%
+  add_model(model_dt)
+
+workflow_knn <- workflow_general %>%
+  add_model(model_knn)
+
+workflow_rf <- workflow_general %>%
+  add_model(model_rf)
+```
+
+
+## Hyperparameter Tuning
+
+As the parameters in the decision tree and XGBoost model are set to tune(), we will now find the optimal values for the parameters. 
+
+### Validation Sampling (N-fold crossvlidation)
+
+We use k-fold crossvalidation to build a set of 5 validation folds with the function vfold_cv. We also use stratified sampling by setting the strata argument to y. We set repeats equal to 3. We dont have to use boosttraps as we have enogh observations.  
+
+```{r}
+set.seed(100)
+
+data_resample <- data_train %>% 
+  vfold_cv(strata = y,
+           v = 3,
+           repeats = 3)
+```
+
+
+### Define Grids
+
+```{r}
+dt_grid <- grid_regular(parameters(model_dt), levels = 3)
+```
+
+
+
+### Hyperparameter Tuning: Decision Tree
+
+First we tune the decision tree, using the tune_grid function where we first specify the workflow, next we give it the resampled data, and last the grid is set to give different versions of every tuneable parameters. 
+```{r}
+tune_dt <-
+  tune_grid(
+    workflow_dt,
+    resamples = data_resample,
+    grid = dt_grid
+  )
+```
+
+```{r}
+tune_dt %>% autoplot()
+```
+
+```{r}
+best_param_dt <- tune_dt %>% select_best(metric = 'roc_auc')
+best_param_dt
+```
+
+```{r}
+tune_dt %>% show_best(metric = 'roc_auc', n = 1)
+```
+
+
+## Fit models with tuned hyperparameters
+
+We now fit the best parameters into the workflow of the model. 
+
+```{r}
+workflow_final_dt <- workflow_dt %>%
+  finalize_workflow(parameters = best_param_dt)
+```
+
+
+## Evaluate models
+here we us the resampled data to evaluate the models. 
+
+### Logistic regression
+We use our workflow object to perform resampling. Furthermore, we use metric_set() to choose some common classification performance metrics provided by the yardstick package. Visit yardsticks reference to see the complete list of all possible metrics.
+
+Note that Cohen’s kappa coefficient (κ) is a similar measure to accuracy, but is normalized by the accuracy that would be expected by chance alone and is very useful when one or more classes have large frequency distributions. The higher the value, the better.
+
+```{r}
+
+log_res <- 
+  workflow_lg %>% 
+  fit_resamples(
+    resamples = data_resample, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+log_res %>% collect_metrics(summarize = TRUE)
+```
+
+### Decision tree
+
+
+```{r}
+dt_res <- 
+  workflow_final_dt %>% 
+  fit_resamples(
+    resamples = data_resample, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE)
+    ) 
+
+dt_res %>% collect_metrics(summarize = TRUE)
+```
+
+### KNN
+```{r}
+knn_res <- 
+  workflow_knn %>% 
+  fit_resamples(
+    resamples = data_resample, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE)
+    ) 
+
+knn_res %>% collect_metrics(summarize = TRUE)
+```
+
+### Random forrest
+
+```{r}
+rf_res <-
+  workflow_rf %>% 
+  fit_resamples(
+    resamples = data_resample, 
+    metrics = metric_set(
+      recall, precision, f_meas, 
+      accuracy, kap,
+      roc_auc, sens, spec),
+    control = control_resamples(save_pred = TRUE)
+    ) 
+
+rf_res %>%  collect_metrics(summarize = TRUE)
+```
+
+## Compare performance
+
+We get a summary for the performed models. We add the model name to each metric to keep the models appart from each other later on. 
+
+```{r}
+log_metrics <- 
+  log_res %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Logistic Regression") 
+
+rf_metrics <- 
+  rf_res %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Random Forest")
+
+knn_metrics <- 
+  knn_res %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Knn")
+
+dt_metrics <- 
+  dt_res %>% 
+  collect_metrics(summarise = TRUE) %>%
+  mutate(model = "Decision tree")
+
+```
+
+
+We now bind the rows for the above metricies and create a dataframe, we then change the data structure and show the mean_f_meas score for each model which include the precision and recall score.
+
+Precision quantifies the number of positive class predictions that actually belong to the positive class. Recall quantifies the number of positive class predictions made out of all positive examples in the dataset. F-Measure provides a single score that balances both the concerns of precision and recall in one number.
+```{r}
+model_compare <- bind_rows(
+                          log_metrics,
+                           rf_metrics,
+                           knn_metrics,
+                          dt_metrics,
+                           ) 
+
+
+model_comp <- 
+  model_compare %>% 
+  select(model, .metric, mean, std_err) %>% 
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err)) 
+
+
+model_comp %>% 
+  arrange(mean_f_meas) %>% 
+  mutate(model = fct_reorder(model, mean_f_meas)) %>% 
+  ggplot(aes(model, mean_f_meas, fill=model)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_brewer(palette = "Blues") +
+   geom_text(
+     size = 3,
+     aes(label = round(mean_f_meas, 2), y = mean_f_meas + 0.08),
+     vjust = 1
+  )
+```
+
+
+```{r}
+model_comp %>% 
+  arrange(mean_roc_auc) %>% 
+  mutate(model = fct_reorder(model, mean_roc_auc)) %>%
+  ggplot(aes(model, mean_roc_auc, fill=model)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_brewer(palette = "Blues") + 
+     geom_text(
+     size = 3,
+     aes(label = round(mean_roc_auc, 2), y = mean_roc_auc + 0.08),
+     vjust = 1
+  )
+```
+
+
+## Choose model
+
+We choose the Logistic regression model 
+
+## Logistic regression model 
+
+### Performance metrics
+Show average performance over all folds.
+
+```{r}
+log_res %>%  collect_metrics(summarize = TRUE)
+```
+
+### Collect model predictions
+To obtain the actual model predictions, we use the function collect_predictions and save the result as xgb_pred:
+
+```{r}
+log_pred <- 
+  log_res %>%
+  collect_predictions()
+```
+
+### Confusion Matrix
+
+We can now use our collected predictions to make a confusion matrix
+```{r}
+log_pred %>% 
+  conf_mat(y, .pred_class) 
+```
+
+And visualize it again
+```{r}
+log_pred %>% 
+  conf_mat(y, .pred_class) %>% 
+  autoplot(type = "mosaic")
+```
+
+
+
+```{r}
+log_pred %>% 
+  conf_mat(y, .pred_class) %>% 
+  autoplot(type = "heatmap")
+```
+
+### ROC curve
+
+We will now create the ROC curve with 1 - specificity on the x-axis (false positive fraction = FP/(FP+TN)) and sensitivity on the y axis (true positive fraction = TP/(TP+FN)).
+```{r}
+log_pred %>% 
+  roc_curve(y, .pred_Drama) %>% 
+  autoplot()
+```
+
+And now using the folds again. 
+```{r}
+log_pred %>% 
+  group_by(id) %>%
+    roc_curve(y, .pred_Drama) %>% 
+  autoplot()
+```
+We again show the probability distributions for our two classes. 
+
+```{r}
+log_pred %>% 
+  ggplot() +
+  geom_density(aes(x = .pred_Drama, 
+                   fill = y), 
+               alpha = 0.5)
+```
+
+
+## On test data
+
+We now use the test data by setting the split argument equal to data_split. 
+
+```{r}
+last_fit_log <- last_fit(workflow_lg, 
+                        split = data_split,
+                        metrics = metric_set(
+                          recall, precision, f_meas, 
+                          accuracy, kap,
+                          roc_auc, sens, spec)
+                        )
+```
+
+
+```{r}
+last_fit_log %>% 
+  collect_metrics()
+```
+
+We can also make the confusion matrix using the test data
+```{r}
+last_fit_log %>%
+  collect_predictions() %>% 
+  conf_mat(y, .pred_class) %>% 
+  autoplot(type = "heatmap")
+
+```
+
+And lastly show the ROC curve using the test data. 
+```{r}
+last_fit_log %>% 
+  collect_predictions() %>% 
+  roc_curve(y, .pred_Drama) %>% 
+  autoplot()
+```
+
+
+## Similarity: doc2vec
+
+We want to use doc2vec to predict similar words/documents from a word/document/sentence. 
+
+
+We follow the recipe: 
+
+- Take some data and standardise it a bit.
+ - Make sure it has columns doc_id and text
+ - Make sure that each text has less than 1000 words (a word is considered separated by a single space)
+ - Make sure that each text does not contain newline symbols
+
+
+```{r}
+data_nlp = data_imdb %>% 
+  rename(text = description) %>%
+  filter(language == "English")%>%
+  rename(id= imdb_title_id) %>%
+  select(id, text)
+  
+```
+
+
+
+We do some dat manipulation and create a subset to be used in the model 
+```{r}
+library(doc2vec)
+library(udpipe)
+x <- data.frame(doc_id = data_nlp$id, 
+                text   = data_nlp$text,
+                stringsAsFactors = FALSE)
+
+x$text   <- tolower(x$text)
+x$text   <- gsub("[^[:alpha:]]", " ", x$text)
+x$text   <- gsub("[[:space:]]+", " ", x$text)
+x$text   <- trimws(x$text)
+x$nwords <- txt_count(x$text, pattern = " ")
+x        <- subset(x, nwords < 1000 & nchar(text) > 0)
+```
+
+### Build the model
+
+
+#### Realistic model
+
+We use the subset on the algorithm 'PV-DBOW': Distributed Bag Of Words paragraph vectors
+
+```{r}
+model <- paragraph2vec(x = x, type = "PV-DBOW", dim = 100, iter = 20, 
+                       min_count = 5, lr = 0.05, threads = 4)
+str(model)
+```
+
+
+## Similarity prediction
+Get similar documents or words when providing sentences, documents or words
+```{r}
+nn <- predict(model, newdata = c("teenage", "vampire"), type = "nearest", 
+              which = "word2word", top_n = 5)
+nn
+```
+
+This suggests a movie based on the keyword. Here we use vampire. So a movie will apear that is most similar to the keyword.
+```{r}
+nn1 <- predict(model, newdata = c("vampire"), type = "nearest", which = "word2doc",  top_n = 5)
+nn1
+
+data_imdb %>%
+  filter(imdb_title_id %in% c("tt1686821", "tt0068284", "tt0074430","tt1608369", "tt3587202"))
+```
+
+Here we can use a specific movie to suggest another similar movie. The ID that we have put in is Alice in wonderland.
+```{r}
+nn2 <- predict(model, newdata = c("tt0004873"), type = "nearest", which = "doc2doc",   top_n = 5)
+nn2
+
+data_imdb %>%
+  filter(imdb_title_id %in% c("tt0021599", "tt0068190", "tt0043719","tt1577811", "tt0111276"))
+```
+
+Here we create a "sentence" (combined of keywords) with the intent of having the model search for movies similar to the sentence.
+```{r}
+sentences <- list(
+  sent1 = c("vampire", "werewolf", "teenager"))
+nn3 <- predict(model, newdata = sentences, type = "nearest", which = "sent2doc", top_n = 5)
+nn3
+
+data_imdb %>%
+  filter(imdb_title_id %in% c(nn3$sent1$term2))
+```
+
+## Network on embedded data
+
+We create the embedings on the top 50 films based ont the average vote score. only taking the top 50 movies. 
+
+```{r}
+data_network_emb = data_imdb %>%
+  filter(genre %in% c("Drama", "Comedy", "Horror", "Thriller"), year >= 2000) %>%
+  filter(language == "English") %>%
+  drop_na() %>%
+  rename(text = description) %>%
+  rename(id= imdb_title_id) %>%
+  arrange(desc(avg_vote)) %>%
+  select(avg_vote, everything()) %>%
+  slice(1:50) %>%
+  select(id, text)
+```
+
+
+
+We create embedings using this recipe 
+```{r}
+Embeding_recipe <- data_network_emb %>%
+  recipe(~.) %>% 
+  update_role(id, new_role = "id") %>%
+  step_tokenize(text, token = 'words') %>%
+  step_stem(text) %>% 
+  step_stopwords(text, keep = FALSE) %>%
+  step_word_embeddings(text, embeddings = embedding_glove6b())%>%
+  prep() %>%
+  juice() 
+
+```
+
+
+We join with the embedings data to get the embedings for the top 50 films
+```{r}
+network_dataset= Embeding_recipe %>%
+  left_join(data_emb_title, by= c("id"= "imdb_title_id")) %>%
+  select(title, everything(), -id)
+```
+
+To keep the names on the films we create a matrix we can join in later. as the names fall away. 
+```{r}
+network_dataset_movies= network_dataset[,1]
+```
+
+We use pca for dimensionality reduction
+```{r}
+network_data_pca <- network_dataset[,c(2:51)] %>% 
+  drop_na() %>%
+  prcomp(center = TRUE , scale = TRUE)
+
+```
+
+* Next, we could create a distance matrix (using the `dist()`) function.
+
+```{r}
+network_data_dist <- network_data_pca$x %>% dist(method = "euclidean") 
+```
+
+La voila. Such a distance matrix representas a relational structure and can be modelled as a network.
+
+```{r}
+g <- network_data_dist %>% 
+  as.matrix() %>%
+  as_tbl_graph(directed = FALSE) 
+```
+
+we create our table graph
+
+```{r}
+g <- g %>% simplify() %>% as_tbl_graph()
+```
+
+We add in the title 
+```{r}
+g = g %N>%
+  mutate(title = network_dataset_movies$title)
+```
+
+show the graph
+```{r}
+g
+```
+
+We add different measures for centrality, and look at the most central movies
+```{r}
+g <- g %N>%
+  mutate(cent_dgr = centrality_degree(weights = weight),
+         cent_eigen = centrality_eigen(weights = weight),
+         cent_between = centrality_betweenness(weights = weight))
+
+most_central_movies= g %N>%
+  as_tibble() %>% 
+  arrange(desc(cent_dgr))
+```
+
+We revert the weight so it looks how similar the movies are. and only pick the top 50% We also filter away isolated nodes.
+```{r}
+g <- g %E>%
+  mutate(weight = max(weight) - weight) %>%
+  filter(weight >= weight %>% quantile(0.50)) %N>%
+  filter(!node_is_isolated()) %>%
+  mutate(community = group_louvain(weights = weight) %>% factor())
+```
+
+Lets take a look!
+
+```{r}
+set.seed(1337)
+g %N>%filter(cent_dgr > 450)%>%
+  ggraph(layout = "kk") + 
+  geom_node_point(aes(col = community, size = centrality_degree(weights = weight))) + 
+  geom_edge_link(aes(width = weight), alpha = 0.25) +
+  scale_edge_width(range = c(0.1, 2)) + 
+  geom_node_text(aes(label = title, filter = percent_rank(centrality_degree(weights = weight)) > 0.5), repel = TRUE) +
+  theme_graph(base_family="sans") + 
+  theme(legend.position = 'bottom')
+```
+The size of the node describing the centrality degree, and edges shows how similar the movies are. The nodes are colored by community. 
+
+### Hiracial network 
+
+We can also create the network using "hclust"
+
+```{r}
+network_data_hc <- network_data_dist %>%
+  hclust(method = "ward.D2")
+```
+
+Again, this structure can be directly transfered to a graph object.
+
+```{r}
+g_hc <- network_data_hc %>% as_tbl_graph()
+```
+
+
+
+```{r}
+g_hc
+```
+
+
+We can plot the network as a dendrogram. 
+```{r}
+g_hc %>% ggraph(layout = 'dendrogram') + 
+  geom_edge_diagonal(aes(col = .N()$height[from])) +
+  geom_node_point(aes(col =height)) +
+  geom_node_text(aes(filter = leaf, label = label), angle=90, hjust=1, nudge_y=-0.1) + 
+  theme_graph() + 
+  theme(legend.position = 'none')
+  ylim(-0.6, NA) 
+```
+We can see which number is which movie in the table under
+
+
+```{r}
+network_dataset_movies %>%
+  mutate(name = 1:50)
+
+```
+
